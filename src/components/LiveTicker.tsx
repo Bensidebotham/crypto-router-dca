@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { LineChart, Line, ResponsiveContainer, XAxis, YAxis } from 'recharts'
 import { SUPPORTED_SYMBOLS, VENUE_METADATA } from '@/config/markets'
-import type { VenueId } from '@/config/markets'
+import type { SupportedSymbol, VenueId } from '@/config/markets'
 
 interface TickerRow {
   symbol: string
@@ -27,6 +27,9 @@ export function LiveTicker() {
   const [status, setStatus] = useState<ConnectionStatus>('loading')
   const [error, setError] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<number | null>(null)
+  const [activeSymbols, setActiveSymbols] = useState<SupportedSymbol[]>(SUPPORTED_SYMBOLS)
+  const [inputValue, setInputValue] = useState('')
+  const [validationError, setValidationError] = useState<string | null>(null)
 
   const rowsRef = useRef<TickerRow[]>([])
   const historiesRef = useRef(histories)
@@ -42,10 +45,19 @@ export function LiveTicker() {
     const fetchData = async () => {
       if (cancelled) return
 
+      if (activeSymbols.length === 0) {
+        setRows([])
+        setHistories({})
+        setStatus('loading')
+        setError(null)
+        setLastUpdated(null)
+        return
+      }
+
       setStatus((prev) => (prev === 'loading' ? 'loading' : 'updating'))
 
       try {
-        const symbolParam = SUPPORTED_SYMBOLS.map((symbol) => encodeURIComponent(symbol)).join(',')
+        const symbolParam = activeSymbols.map((symbol) => encodeURIComponent(symbol)).join(',')
         const response = await fetch(`/api/router/quote?symbols=${symbolParam}`, { cache: 'no-store' })
         if (!response.ok) {
           throw new Error(`Router API error: ${response.status}`)
@@ -59,6 +71,8 @@ export function LiveTicker() {
 
         for (const symbolResult of payload.symbols ?? []) {
           const symbol: string = symbolResult.symbol
+          if (!activeSymbols.includes(symbol as SupportedSymbol)) continue
+
           const bestVenue = symbolResult.bestVenue
           const venueQuotes: Array<{ venueId: string; status: string; bid: number | null; ask: number | null; timestamp: number | null }> =
             symbolResult.venues ?? []
@@ -152,7 +166,7 @@ export function LiveTicker() {
         clearTimeout(timer)
       }
     }
-  }, [])
+  }, [activeSymbols])
 
   const statusColor = useMemo(() => {
     switch (status) {
@@ -208,6 +222,45 @@ export function LiveTicker() {
       maximumFractionDigits: 2
     }).format(value)
 
+  const availableSymbols = useMemo(
+    () => SUPPORTED_SYMBOLS.filter((symbol) => !activeSymbols.includes(symbol)),
+    [activeSymbols]
+  )
+
+  const handleAddSymbol = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const normalized = inputValue.trim().toUpperCase() as SupportedSymbol
+
+    if (!normalized) {
+      setValidationError('Enter a symbol, e.g. BTC/USDT')
+      return
+    }
+
+    if (!SUPPORTED_SYMBOLS.includes(normalized)) {
+      setValidationError('Symbol is not available. Try BTC/USDT, ETH/USDT, SOL/USDT, or ADA/USDT.')
+      return
+    }
+
+    if (activeSymbols.includes(normalized)) {
+      setValidationError('Symbol is already being tracked.')
+      return
+    }
+
+    setActiveSymbols((prev) => [...prev, normalized])
+    setInputValue('')
+    setValidationError(null)
+  }
+
+  const handleRemoveSymbol = (symbol: SupportedSymbol) => {
+    setActiveSymbols((prev) => prev.filter((item) => item !== symbol))
+    setRows((prev) => prev.filter((row) => row.symbol !== symbol))
+    setHistories((prev) => {
+      const updated = { ...prev }
+      delete updated[symbol]
+      return updated
+    })
+  }
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -230,6 +283,41 @@ export function LiveTicker() {
           {error}
         </div>
       )}
+
+      <form onSubmit={handleAddSymbol} className="rounded-2xl border border-slate-200 bg-white/90 p-4 shadow-sm">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="text-sm font-semibold text-slate-800">Track another market</p>
+            <p className="text-xs text-slate-500">Supported: {SUPPORTED_SYMBOLS.join(', ')}</p>
+          </div>
+          <div className="flex w-full gap-2 sm:w-auto">
+            <input
+              value={inputValue}
+              onChange={(event) => {
+                setInputValue(event.target.value.toUpperCase())
+                setValidationError(null)
+              }}
+              list="supported-symbols"
+              placeholder="e.g. BTC/USDT"
+              className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-sky-300 sm:w-48"
+            />
+            <datalist id="supported-symbols">
+              {availableSymbols.map((symbol) => (
+                <option key={symbol} value={symbol} />
+              ))}
+            </datalist>
+            <button
+              type="submit"
+              className="rounded-lg bg-sky-600 px-3 py-2 text-sm font-semibold text-white transition hover:bg-sky-700"
+            >
+              Add
+            </button>
+          </div>
+        </div>
+        {validationError && (
+          <p className="mt-2 text-xs font-medium text-red-600">{validationError}</p>
+        )}
+      </form>
 
       <div className="space-y-2">
         {rows.length > 0 ? (
@@ -262,9 +350,18 @@ export function LiveTicker() {
                       {row.changePct.toFixed(2)}%
                     </div>
                   </div>
-                  <div className="text-right">
-                    <div className="font-mono text-lg text-slate-900">{formatCurrency(row.price)}</div>
-                    <div className="text-xs text-slate-500">Prev {formatCurrency(row.previousPrice)}</div>
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveSymbol(row.symbol as SupportedSymbol)}
+                      className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs font-semibold text-slate-500 transition hover:border-red-200 hover:text-red-600"
+                    >
+                      Remove
+                    </button>
+                    <div className="text-right">
+                      <div className="font-mono text-lg text-slate-900">{formatCurrency(row.price)}</div>
+                      <div className="text-xs text-slate-500">Prev {formatCurrency(row.previousPrice)}</div>
+                    </div>
                   </div>
                 </div>
               </div>
