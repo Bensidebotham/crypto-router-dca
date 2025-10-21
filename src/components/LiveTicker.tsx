@@ -1,283 +1,278 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
-import { LineChart, Line, ResponsiveContainer, XAxis, YAxis, Tooltip } from 'recharts'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { LineChart, Line, ResponsiveContainer, XAxis, YAxis } from 'recharts'
+import { SUPPORTED_SYMBOLS, VENUE_METADATA } from '@/config/markets'
+import type { VenueId } from '@/config/markets'
 
-interface PriceData {
+interface TickerRow {
   symbol: string
-  price: string
+  displaySymbol: string
+  price: number
+  previousPrice: number
+  changeAbs: number
+  changePct: number
+  venueLabel: string
   timestamp: number
-  exchange: string
-  previousPrice?: string
-  priceChange?: number
-  priceChangePercent?: number
 }
 
-const SYMBOLS = ['btcusdt', 'ethusdt', 'solusdt', 'adausdt'] // add more (lowercase) if you want
-const CONNECTION_TIMEOUT = 10000 // 10 seconds
-const HISTORY_POINTS = 60 // keep last 60 points per symbol (~1 min @ ~1s ticks)
+type ConnectionStatus = 'loading' | 'online' | 'updating' | 'error'
+
+const HISTORY_POINTS = 90
+const POLL_INTERVAL = 5_000
 
 export function LiveTicker() {
-  const [prices, setPrices] = useState<PriceData[]>([])
+  const [rows, setRows] = useState<TickerRow[]>([])
   const [histories, setHistories] = useState<Record<string, number[]>>({})
-  const [isConnected, setIsConnected] = useState(false)
-  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'error'>('connecting')
-  const wsRef = useRef<WebSocket | null>(null)
-  const reconnectAttempts = useRef(0)
-  const shuttingDown = useRef(false)
-  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const connectionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [status, setStatus] = useState<ConnectionStatus>('loading')
+  const [error, setError] = useState<string | null>(null)
+  const [lastUpdated, setLastUpdated] = useState<number | null>(null)
+
+  const rowsRef = useRef<TickerRow[]>([])
+  const historiesRef = useRef(histories)
 
   useEffect(() => {
-    const scheduleReconnect = () => {
-      if (shuttingDown.current) return
+    historiesRef.current = histories
+  }, [histories])
 
-      setIsConnected(false)
-      setConnectionStatus('disconnected')
+  useEffect(() => {
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
 
-      const attempt = Math.min(reconnectAttempts.current + 1, 5)
-      reconnectAttempts.current = attempt
-      const delay = Math.min(500 * Math.pow(2, attempt), 30000) // Cap at 30 seconds
+    const fetchData = async () => {
+      if (cancelled) return
 
-      // eslint-disable-next-line no-console
-      console.log(`Reconnecting in ${delay}ms (attempt ${attempt})`)
-
-      reconnectTimeoutRef.current = setTimeout(() => {
-        if (!shuttingDown.current) {
-          connect()
-        }
-      }, delay)
-    }
-
-    function connect() {
-      if (shuttingDown.current) return
-
-      setConnectionStatus('connecting')
-      const streams = SYMBOLS.map((s) => `${s}@trade`).join('/')
-      const url = `wss://stream.binance.com:9443/stream?streams=${streams}`
+      setStatus((prev) => (prev === 'loading' ? 'loading' : 'updating'))
 
       try {
-        const ws = new WebSocket(url)
-        wsRef.current = ws
-
-        // Set connection timeout
-        connectionTimeoutRef.current = setTimeout(() => {
-          if (ws.readyState === WebSocket.CONNECTING) {
-            // eslint-disable-next-line no-console
-            console.log('Connection timeout, closing and retrying...')
-            ws.close()
-            scheduleReconnect()
-          }
-        }, CONNECTION_TIMEOUT)
-
-        ws.onopen = () => {
-          // Clear connection timeout
-          if (connectionTimeoutRef.current) {
-            clearTimeout(connectionTimeoutRef.current)
-            connectionTimeoutRef.current = null
-          }
-
-          setIsConnected(true)
-          setConnectionStatus('connected')
-          reconnectAttempts.current = 0
-          // eslint-disable-next-line no-console
-          console.log('Connected to Binance WebSocket')
+        const symbolParam = SUPPORTED_SYMBOLS.map((symbol) => encodeURIComponent(symbol)).join(',')
+        const response = await fetch(`/api/router/quote?symbols=${symbolParam}`, { cache: 'no-store' })
+        if (!response.ok) {
+          throw new Error(`Router API error: ${response.status}`)
         }
 
-        ws.onmessage = (event) => {
-          try {
-            // Combined stream payload shape: { stream: 'btcusdt@trade', data: { s: 'BTCUSDT', p: '...', E: 1710000000000 } }
-            const msg = JSON.parse(event.data)
-            const d = msg?.data
-            if (!d || !d.s || !d.p) return
+        const payload = await response.json()
+        if (cancelled) return
 
-            const symbol: string = d.s // e.g. 'BTCUSDT'
-            const currentPriceNum = Number(d.p)
-            const currentPrice = currentPriceNum.toFixed(2)
-            const timestamp = d.E || Date.now()
+        const pricesForHistory: Record<string, number> = {}
+        const nextRows: TickerRow[] = []
 
-            setPrices((prev) => {
-              const existingPrice = prev.find((p) => p.symbol === symbol)
-              const previousPrice = existingPrice?.price
-              const priceChange = previousPrice ? Number(currentPrice) - Number(previousPrice) : 0
-              const priceChangePercent = previousPrice ? (priceChange / Number(previousPrice)) * 100 : 0
+        for (const symbolResult of payload.symbols ?? []) {
+          const symbol: string = symbolResult.symbol
+          const bestVenue = symbolResult.bestVenue
+          const venueQuotes: Array<{ venueId: string; status: string; bid: number | null; ask: number | null; timestamp: number | null }> =
+            symbolResult.venues ?? []
 
-              const price: PriceData = {
-                symbol,
-                price: currentPrice,
-                timestamp,
-                exchange: 'BINANCE',
-                previousPrice,
-                priceChange,
-                priceChangePercent,
-              }
-
-              const filtered = prev.filter((p) => p.symbol !== symbol)
-              return [...filtered, price].sort((a, b) => a.symbol.localeCompare(b.symbol))
-            })
-
-            // Keep rolling history for sparkline
-            setHistories((prev) => {
-              const arr = prev[symbol] ? [...prev[symbol]] : []
-              arr.push(currentPriceNum)
-              if (arr.length > HISTORY_POINTS) arr.shift()
-              return { ...prev, [symbol]: arr }
-            })
-          } catch (err) {
-            // eslint-disable-next-line no-console
-            console.error('WS parse error:', err)
-          }
-        }
-
-        ws.onerror = () => {
-          setConnectionStatus('error')
-          // onclose will schedule reconnect
-        }
-
-        ws.onclose = (event) => {
-          // Clear connection timeout
-          if (connectionTimeoutRef.current) {
-            clearTimeout(connectionTimeoutRef.current)
-            connectionTimeoutRef.current = null
+          let price: number | null = null
+          if (bestVenue) {
+            price = bestVenue.effectiveMidPrice ?? bestVenue.midPrice ?? null
           }
 
-          // eslint-disable-next-line no-console
-          console.log(`WebSocket closed: code=${event.code}, reason=${event.reason || 'No reason'}`)
-
-          // Only reconnect if it wasn't a clean close and we're not shutting down
-          if (!event.wasClean && !shuttingDown.current) {
-            scheduleReconnect()
-          } else if (event.wasClean) {
-            setConnectionStatus('disconnected')
-            setIsConnected(false)
+          if (price === null) {
+            const fallback = symbolResult.comparisons?.[0]
+            price = fallback?.effectiveMidPrice ?? fallback?.midPrice ?? null
           }
+
+          const previousRow = rowsRef.current.find((row) => row.symbol === symbol)
+
+          if (price === null || !isFinite(price)) {
+            if (previousRow) {
+              nextRows.push(previousRow)
+            }
+            continue
+          }
+
+          const quoteForBest = bestVenue
+            ? venueQuotes.find((quote) => quote.venueId === bestVenue.venue.id && quote.status === 'ok')
+            : undefined
+
+          const bestVenueId = bestVenue?.venue.id as VenueId | undefined
+          const venueLabel = bestVenueId
+            ? VENUE_METADATA[bestVenueId]?.label ?? bestVenue?.venue.name ?? 'Unavailable'
+            : 'Unavailable'
+
+          const timestamp = quoteForBest?.timestamp ?? previousRow?.timestamp ?? Date.now()
+
+          const previousPrice = previousRow?.price ?? price
+          const changeAbs = price - previousPrice
+          const changePct = previousPrice !== 0 ? (changeAbs / previousPrice) * 100 : 0
+
+          pricesForHistory[symbol] = price
+
+          nextRows.push({
+            symbol,
+            displaySymbol: symbol,
+            price,
+            previousPrice,
+            changeAbs,
+            changePct,
+            venueLabel,
+            timestamp
+          })
         }
-      } catch (error) {
-        // eslint-disable-next-line no-console
-        console.error('Failed to create WebSocket connection:', error)
-        setConnectionStatus('error')
-        scheduleReconnect()
+
+        nextRows.sort((a, b) => a.symbol.localeCompare(b.symbol))
+
+        rowsRef.current = nextRows
+        setRows(nextRows)
+
+        setHistories((prev) => {
+          const updated = { ...prev }
+
+          Object.entries(pricesForHistory).forEach(([symbol, price]) => {
+            const arr = updated[symbol] ? [...updated[symbol]] : []
+            arr.push(price)
+            if (arr.length > HISTORY_POINTS) arr.shift()
+            updated[symbol] = arr
+          })
+
+          historiesRef.current = updated
+          return updated
+        })
+
+        setStatus('online')
+        setError(null)
+        setLastUpdated(Date.now())
+      } catch (err) {
+        if (cancelled) return
+        setStatus('error')
+        setError(err instanceof Error ? err.message : 'Failed to load ticker')
+      } finally {
+        if (!cancelled) {
+          timer = setTimeout(fetchData, POLL_INTERVAL)
+        }
       }
     }
 
-    connect()
+    fetchData()
 
     return () => {
-      shuttingDown.current = true
-
-      // Clear all timeouts
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current)
+      cancelled = true
+      if (timer) {
+        clearTimeout(timer)
       }
-      if (connectionTimeoutRef.current) {
-        clearTimeout(connectionTimeoutRef.current)
-      }
-
-      try {
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.close(1000, 'Component unmounting')
-        }
-      } catch {}
     }
   }, [])
 
-  const getConnectionStatusColor = () => {
-    switch (connectionStatus) {
-      case 'connected':
+  const statusColor = useMemo(() => {
+    switch (status) {
+      case 'online':
         return 'bg-green-500'
-      case 'connecting':
+      case 'updating':
         return 'bg-yellow-500'
       case 'error':
         return 'bg-red-500'
       default:
-        return 'bg-gray-500'
+        return 'bg-slate-400'
     }
-  }
+  }, [status])
 
-  const getConnectionStatusText = () => {
-    switch (connectionStatus) {
-      case 'connected':
-        return 'Live (Binance)'
-      case 'connecting':
-        return 'Connecting...'
+  const statusText = useMemo(() => {
+    switch (status) {
+      case 'online':
+        return 'Live (Router)'
+      case 'updating':
+        return 'Refreshing quotes…'
       case 'error':
-        return 'Connection Error'
+        return 'Connection error'
+      case 'loading':
       default:
-        return 'Disconnected'
+        return 'Initializing…'
     }
-  }
-
-  const formatPriceChange = (change: number, percent: number) => {
-    const isPositive = change >= 0
-    const sign = isPositive ? '+' : ''
-    return (
-      <div className={`text-right ${isPositive ? 'text-green-600' : 'text-red-600'}`}>
-        <div className="font-mono text-sm">
-          {sign}${change.toFixed(2)}
-        </div>
-        <div className="text-xs">
-          {sign}
-          {percent.toFixed(2)}%
-        </div>
-      </div>
-    )
-  }
+  }, [status])
 
   const Sparkline = ({ symbol }: { symbol: string }) => {
-    const arr = histories[symbol] || []
-    // map to objects for Recharts
-    const data = arr.map((v, i) => ({ i, v }))
-    if (data.length < 2) return <div className="w-28 h-10" />
+    const data = (histories[symbol] ?? []).map((value, index) => ({ index, value }))
+    if (data.length < 2) {
+      return <div className="h-10 w-28 rounded-md bg-slate-100" />
+    }
+
     return (
-      <div className="w-28 h-10">
+      <div className="h-10 w-28">
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={data} margin={{ top: 4, bottom: 0, left: 0, right: 0 }}>
-            <XAxis dataKey="i" hide />
+            <XAxis dataKey="index" hide />
             <YAxis hide domain={['auto', 'auto']} />
-            <Tooltip formatter={(val: number) => `$${val.toFixed(2)}`} labelFormatter={() => ''} />
-            <Line type="monotone" dataKey="v" dot={false} strokeWidth={2} />
+            <Line type="monotone" dataKey="value" dot={false} stroke="#38bdf8" strokeWidth={2} />
           </LineChart>
         </ResponsiveContainer>
       </div>
     )
   }
 
+  const formatCurrency = (value: number) =>
+    new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'USD',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(value)
+
   return (
     <div className="space-y-4">
-      <div className="flex items-center gap-2">
-        <div className={`w-3 h-3 rounded-full ${getConnectionStatusColor()} animate-pulse`} />
-        <span className="text-sm font-medium text-gray-800">{getConnectionStatusText()}</span>
-        {connectionStatus === 'connected' && (
-          <span className="text-xs text-green-700 bg-green-100 px-2 py-1 rounded-full font-medium">{prices.length} symbols</span>
-        )}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className={`h-3 w-3 rounded-full ${statusColor} ${status === 'online' ? 'animate-pulse' : ''}`} />
+          <span className="text-sm font-medium text-slate-700">{statusText}</span>
+          {status === 'online' && (
+            <span className="rounded-full bg-sky-50 px-2 py-0.5 text-xs font-medium text-sky-600">
+              {rows.length} symbols
+            </span>
+          )}
+        </div>
+        <span className="text-xs text-slate-500">
+          {lastUpdated ? `Updated ${new Date(lastUpdated).toLocaleTimeString()}` : 'Waiting for data…'}
+        </span>
       </div>
 
+      {error && (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600">
+          {error}
+        </div>
+      )}
+
       <div className="space-y-2">
-        {prices.length > 0 ? (
-          prices.map((price) => (
-            <div
-              key={price.symbol}
-              className="flex justify-between items-center p-3 bg-gray-50 rounded-lg hover:bg-gray-100 transition-colors"
-            >
-              <div>
-                <span className="font-semibold text-gray-900">{price.symbol}</span>
-                <span className="text-sm text-gray-600 ml-2">({price.exchange})</span>
-              </div>
-              <div className="flex items-center gap-4">
-                <Sparkline symbol={price.symbol} />
-                {price.priceChange !== undefined && price.priceChangePercent !== undefined
-                  ? formatPriceChange(price.priceChange, price.priceChangePercent)
-                  : null}
-                <div className="text-right">
-                  <div className="font-mono text-lg text-gray-900">${price.price}</div>
-                  <div className="text-xs text-gray-600">{new Date(price.timestamp).toLocaleTimeString()}</div>
+        {rows.length > 0 ? (
+          rows.map((row) => {
+            const isPositive = row.changeAbs >= 0
+            return (
+              <div
+                key={row.symbol}
+                className="flex items-center justify-between rounded-xl border border-slate-200 bg-white/90 px-3 py-3 shadow-sm transition hover:-translate-y-0.5 hover:border-sky-200 hover:shadow-md"
+              >
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-base font-semibold text-slate-900">{row.displaySymbol}</span>
+                    <span className="text-xs font-medium text-slate-500">{row.venueLabel}</span>
+                  </div>
+                  <div className="text-xs text-slate-400">
+                    {new Date(row.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-4">
+                  <Sparkline symbol={row.symbol} />
+                  <div className={`text-right ${isPositive ? 'text-emerald-600' : 'text-red-600'}`}>
+                    <div className="text-sm font-semibold">
+                      {isPositive ? '+' : ''}
+                      {row.changeAbs.toFixed(2)}
+                    </div>
+                    <div className="text-xs">
+                      {isPositive ? '+' : ''}
+                      {row.changePct.toFixed(2)}%
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="font-mono text-lg text-slate-900">{formatCurrency(row.price)}</div>
+                    <div className="text-xs text-slate-500">Prev {formatCurrency(row.previousPrice)}</div>
+                  </div>
                 </div>
               </div>
-            </div>
-          ))
+            )
+          })
         ) : (
-          <div className="text-center text-gray-700 py-8 font-medium">
-            {connectionStatus === 'connecting' ? 'Connecting to Binance...' : 'Waiting for price data...'}
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-8 text-center text-sm font-medium text-slate-500">
+            {status === 'error' ? 'Unable to load live quotes right now.' : 'Waiting for first update…'}
           </div>
         )}
       </div>
