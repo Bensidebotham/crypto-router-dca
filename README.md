@@ -20,7 +20,7 @@ A real-time cryptocurrency exchange routing and Dollar-Cost Averaging (DCA) stra
 
 ## 📸 Screenshot
 
-![Dashboard Overview](Screenshot%202025-10-21%20at%209.08.48%20PM.png)
+![Dashboard Overview](./dashboardScreensho.png)
 
 *Dashboard showing real-time cryptocurrency prices, exchange spread analysis, and routing intelligence*
 
